@@ -1,0 +1,29 @@
+name: idr_cal
+channels:
+    - conda-forge
+dependencies:
+    - python=3.11
+    - dask
+    - matplotlib
+    - numpy
+    - pandas
+    - xarray
+    - zarr
+    - gcsfs
+    - scipy
+    - tqdm
+    - osqp
+    - numba
+
+    # build-time dependency for C++/pybind packages (crpsmixture)
+    # NOTE: crpsmixture must be installed manually with pip --no-build-isolation
+    - pybind11
+
+    # needed to pip-install from git
+    - pip
+    - git
+
+    # pip-only dependencies
+    - pip:
+        - dc_stat_think>=1.1.1
+        - "isodisreg @ git+https://github.com/evwalz/isodisreg.git@413b052d9708d376349986b1f6dd465e6c0b8f64"

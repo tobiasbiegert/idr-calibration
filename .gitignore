@@ -1,0 +1,15 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Generated outputs
+plots/
+
+# Local environment snapshots (machine-specific)
+pip-freeze.txt
+conda-spec.txt
