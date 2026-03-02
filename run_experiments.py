@@ -1,20 +1,24 @@
 """
-Run wind-speed and simulation experiments for IDR PIT values.
+Run wind-speed and simulation experiments for basic, Gaussian-smoothed, and linearly interpolated IDR PIT/CRPS comparisons.
 """
+import os
+import multiprocessing
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
 
 import numpy as np
 import pandas as pd
 import xarray as xr
+from dask.diagnostics import ProgressBar
+
 from isodisreg import idr
+from crpsmixture import smooth_crps
+
+from fractions import Fraction
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
-from dask.diagnostics import ProgressBar
-from tqdm import tqdm
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
-from fractions import Fraction
-from crpsmixture import smooth_crps
-from helper_functions import tune_gaussian_bandwidth_onefit, pit_gaussian_kernel
+
+from helper_functions import tune_gaussian_bandwidth_onefit, pit_gaussian_kernel, pit_linear, crps_linear
 
 # Overall settings
 DIGITS = 8
@@ -58,7 +62,7 @@ def work_h_ws(idx):
     fit = idr(y_train, pd.DataFrame({G_WS["var"]: x_train}))
     preds_train = fit.predict(pd.DataFrame({G_WS["var"]: x_train}), digits=G_WS["digits"])
 
-    h, ll_train = tune_gaussian_bandwidth_onefit(preds_train, y_train)
+    h, _ = tune_gaussian_bandwidth_onefit(preds_train, y_train)
     return h
 
 def work_ws(idx):
@@ -73,11 +77,13 @@ def work_ws(idx):
 
     pit = preds_test.pit(y_test, seed=G_WS["base_seed"] + 10_000 * i + j)
     pit_s = pit_gaussian_kernel(preds_test, y_test, G_WS["h"])
+    pit_l = pit_linear(preds_test, y_test)
 
     c = np.mean(preds_test.crps(y_test))
     cs = smooth_crps(preds_test, y_test, G_WS["h"], df=None)
+    cl = np.mean(crps_linear(preds_test, y_test))
 
-    return i, j, pit, pit_s, c, cs
+    return i, j, pit, pit_s, pit_l, c, cs, cl
 
 # Simulation workers
 def make_data(seed):
@@ -98,28 +104,30 @@ def init_sim(base_seed_, digits_, col_, h_):
 
 def work_h_sim(it):
     seed = G_S["base_seed"] + it
-    x_train, Y_train, _, _ = make_data(seed)
+    x_train, y_train, _, _ = make_data(seed)
 
-    fit = idr(Y_train, pd.DataFrame({G_S["col"]: x_train}))
+    fit = idr(y_train, pd.DataFrame({G_S["col"]: x_train}))
     preds_train = fit.predict(pd.DataFrame({G_S["col"]: x_train}), digits=G_S["digits"])
 
-    h, ll_train = tune_gaussian_bandwidth_onefit(preds_train, Y_train)
+    h, _ = tune_gaussian_bandwidth_onefit(preds_train, y_train)
     return h
 
 def work_sim(it):
     seed = G_S["base_seed"] + 100_000 + it
-    x_train, Y_train, X_test, Y_test = make_data(seed)
+    x_train, y_train, x_test, y_test = make_data(seed)
 
-    fit = idr(Y_train, pd.DataFrame({G_S["col"]: x_train}))
-    preds_test = fit.predict(pd.DataFrame({G_S["col"]: X_test}), digits=G_S["digits"])
+    fit = idr(y_train, pd.DataFrame({G_S["col"]: x_train}))
+    preds_test = fit.predict(pd.DataFrame({G_S["col"]: x_test}), digits=G_S["digits"])
 
-    pit = preds_test.pit(Y_test, seed=G_S["base_seed"] + 200_000 + it)
-    pit_s = pit_gaussian_kernel(preds_test, Y_test, G_S["h"])
+    pit = preds_test.pit(y_test, seed=G_S["base_seed"] + 200_000 + it)
+    pit_s = pit_gaussian_kernel(preds_test, y_test, G_S["h"])
+    pit_l = pit_linear(preds_test, y_test)
 
-    c = np.mean(preds_test.crps(Y_test))
-    cs = smooth_crps(preds_test, Y_test, G_S["h"], df=None)
+    c = np.mean(preds_test.crps(y_test))
+    cs = smooth_crps(preds_test, y_test, G_S["h"], df=None)
+    cl = np.mean(crps_linear(preds_test, y_test))
 
-    return it, pit, pit_s, c, cs
+    return it, pit, pit_s, pit_l, c, cs, cl
 
 # Plotting helpers
 def add_fraction_guides(ax, x_values, x_shift=-0.021, y_frac=0.94):
@@ -204,9 +212,11 @@ def main():
     # Full grid evaluation
     pit_ws = np.empty_like(X_test, dtype=np.float64)
     pit_ws_smooth = np.empty_like(X_test, dtype=np.float64)
+    pit_ws_linear = np.empty_like(X_test, dtype=np.float64)
 
     crps_ws = np.empty((nlon, nlat), dtype=np.float64)
     crps_ws_smooth = np.empty((nlon, nlat), dtype=np.float64)
+    crps_ws_linear = np.empty((nlon, nlat), dtype=np.float64)
 
     with ProcessPoolExecutor(
         max_workers=MAX_WORKERS,
@@ -214,18 +224,21 @@ def main():
         initargs=(BASE_SEED, X_train, Y_train, VAR, DIGITS, X_test, Y_test, h_ws),
         mp_context=ctx,
     ) as ex:
-        for i, j, p, ps, c, cs in tqdm(
+        for i, j, p, ps, pl, c, cs, cl in tqdm(
             ex.map(work_ws, indices, chunksize=1),
             total=len(indices),
             desc="WS grid",
         ):
             pit_ws[:, i, j] = p
             pit_ws_smooth[:, i, j] = ps
+            pit_ws_linear[:, i, j] = pl
             crps_ws[i, j] = c
             crps_ws_smooth[i, j] = cs
+            crps_ws_linear[i, j] = cl
 
     print("Mean CRPS (wind speed, basic):   ", np.mean(crps_ws))
     print("Mean CRPS (wind speed, smooth):", np.mean(crps_ws_smooth))
+    print("Mean CRPS (wind speed, linear interpolation):", np.mean(crps_ws_linear))
 
     # Simulation
     with ProcessPoolExecutor(
@@ -248,8 +261,11 @@ def main():
 
     pit_sim = np.empty((NUM_ITERATIONS, N_TEST), dtype=np.float64)
     pit_sim_smooth = np.empty((NUM_ITERATIONS, N_TEST), dtype=np.float64)
+    pit_sim_linear = np.empty((NUM_ITERATIONS, N_TEST), dtype=np.float64)
+    
     crps_sim = np.empty(NUM_ITERATIONS, dtype=np.float64)
     crps_sim_smooth = np.empty(NUM_ITERATIONS, dtype=np.float64)
+    crps_sim_linear = np.empty(NUM_ITERATIONS, dtype=np.float64)
 
     with ProcessPoolExecutor(
         max_workers=MAX_WORKERS,
@@ -257,20 +273,25 @@ def main():
         initargs=(BASE_SEED, DIGITS, COL, h_sim),
         mp_context=ctx,
     ) as ex:
-        for it, p, ps, c, cs in tqdm(
+        for it, p, ps, pl, c, cs, cl in tqdm(
             ex.map(work_sim, range(NUM_ITERATIONS), chunksize=1),
             total=NUM_ITERATIONS,
             desc="Simulation",
         ):
             pit_sim[it, :] = p
             pit_sim_smooth[it, :] = ps
+            pit_sim_linear[it, :] = pl
             crps_sim[it] = c
             crps_sim_smooth[it] = cs
+            crps_sim_linear[it] = cl
 
     print("Mean CRPS (simulation, IDR):   ", np.mean(crps_sim))
     print("Mean CRPS (simulation, smooth):", np.mean(crps_sim_smooth))
+    print("Mean CRPS (simulation, linear interpolation):", np.mean(crps_sim_linear))
 
     # Plots
+    os.makedirs("plots", exist_ok=True)
+    
     plt.rcParams.update({
         "mathtext.fontset": "stix",
         "font.family": "STIXGeneral",
@@ -323,6 +344,15 @@ def main():
     axes[0].set_ylabel("Density")
     plt.tight_layout()
     plt.savefig("plots/pit_smooth.png", dpi=300, facecolor="white", edgecolor="none", bbox_inches="tight")
+    plt.close()
+    
+    # Figure 4: Linear PIT
+    fig, axes = plt.subplots(1, 2, figsize=(18, 6), sharey=True)
+    pit_panel(axes[0], pit_ws_linear.ravel(), "Wind Speed", x_values)
+    pit_panel(axes[1], pit_sim_linear.ravel(), "Simulation", x_values)
+    axes[0].set_ylabel("Density")
+    plt.tight_layout()
+    plt.savefig("plots/pit_linear.png", dpi=300, facecolor="white", edgecolor="none", bbox_inches="tight")
     plt.close()
     
 if __name__ == "__main__":
